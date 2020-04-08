@@ -3,7 +3,7 @@ package raft_test
 import (
 	"errors"
 
-	"github.com/konrad/raft"
+	"github.com/donrak/raft"
 )
 
 type command struct {

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/konrad/raft"
+	"github.com/donrak/raft"
 )
 
 func TestSingleNode(t *testing.T) {
