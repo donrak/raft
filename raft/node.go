@@ -2,34 +2,25 @@ package raft
 
 import (
 	"errors"
-	"math/rand"
 	"sync"
 	"time"
 )
 
 type clusterNode struct {
-	id                      int
-	peers                   map[int]NodeAddress
-	state                   *state
-	stateMachine            StateMachine
-	transport               Transport
-	requestVoteResultCh     chan RequestVoteResult
-	requestVoteRequestCh    chan RequestVoteRequest
-	appendEntriesResultCh   chan appendEntriesResultWithContext
-	appendEntriesRequestCh  chan AppendEntriesRequest
-	applyEntriesCh          chan struct{}
-	startElectionCh         chan struct{}
-	resetElectionTimeoutCh  chan struct{}
-	stopElectionTimerCh     chan struct{}
-	resetHeartbeatTimeoutCh chan struct{}
-	stopHeartbeatCh         chan struct{}
-	sendAppendEntriesCh     chan struct{}
-	shutdownCh              chan struct{}
-	requestCommandRequestCh chan commandRequest
-	commandResultsCh        chan commandResultWithContext
-	getStateRequestCh       chan getStateRequest
-	commandResultsChMap     map[int]chan CommandResult
-	shutdownLock            sync.RWMutex
+	id                  int
+	peers               map[int]NodeAddress
+	state               *state
+	controller          *nodeController
+	stateMachine        StateMachine	
+	shutdownLock        sync.RWMutex
+	commandResultsChMap map[int]chan CommandResult
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (node *clusterNode) switchToFollowerMode(term int, leaderID int) {
@@ -37,8 +28,8 @@ func (node *clusterNode) switchToFollowerMode(term int, leaderID int) {
 	node.state.votedFor = -1
 	node.state.leaderID = leaderID
 	if node.state.getMode() == Leader {
-		node.stopHeartbeatCh <- struct{}{}
-		node.runElectionTimer()
+		node.controller.stopHeartbeat()
+		node.controller.runElectionTimer()
 	}
 	node.state.setMode(Follower)
 }
@@ -51,12 +42,10 @@ func (node *clusterNode) switchToCandidateMode() {
 }
 
 func (node *clusterNode) switchToLeaderMode() {
-	go func() {
-		node.stopElectionTimerCh <- struct{}{}
-	}()
+	node.controller.stopElectionTimer()
 	node.state.setMode(Leader)
 	node.state.leaderID = node.id
-	node.runHeartbeat()
+	node.controller.runHeartbeat()
 }
 
 func (node *clusterNode) getQuorum() int {
@@ -79,9 +68,7 @@ func (node *clusterNode) requestVote(args RequestVoteArgs) RequestVoteResult {
 			(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)) {
 		result.VoteGranted = true
 		state.votedFor = args.CandidateID
-		go func() {
-			node.resetElectionTimeoutCh <- struct{}{}
-		}()
+		node.controller.resetElectionTimeout()
 	}
 
 	result.Term = state.currentTerm
@@ -99,9 +86,7 @@ func (node *clusterNode) appendEntries(args *AppendEntriesArgs) AppendEntriesRes
 		return result
 	}
 
-	go func() {
-		node.resetElectionTimeoutCh <- struct{}{}
-	}()
+	node.controller.resetElectionTimeout()
 
 	if args.Term > state.currentTerm || state.leaderID == -1 {
 		node.switchToFollowerMode(args.Term, args.LeaderID)
@@ -115,9 +100,7 @@ func (node *clusterNode) appendEntries(args *AppendEntriesArgs) AppendEntriesRes
 		state.log = appendEntries(state.log, args.Entries, args.PrevLogIndex)
 		if args.LeaderCommit > node.state.commitIndex {
 			node.state.commitIndex = min(args.LeaderCommit, len(state.log)-1)
-			go func() {
-				node.applyEntriesCh <- struct{}{}
-			}()
+			node.controller.applyEntries()
 		}
 	}
 
@@ -142,13 +125,6 @@ func appendEntries(log []LogEntry, newEntries []LogEntry, prevLogIndex int) []Lo
 	return append(log[:logInsertIndex], newEntries[newEntriesIndex:]...)
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 func (node *clusterNode) startElection() {
 	node.switchToCandidateMode()
 	if len(node.peers) == 0 {
@@ -166,12 +142,7 @@ func (node *clusterNode) startElection() {
 	}
 
 	for _, peerAddress := range node.peers {
-		go func(peerAddress NodeAddress) {
-			voteResult, err := node.transport.RequestVote(peerAddress, args)
-			if err == nil {
-				node.requestVoteResultCh <- voteResult
-			}
-		}(peerAddress)
+		node.controller.sendRequestVote(peerAddress, args)
 	}
 }
 
@@ -218,10 +189,8 @@ func (node *clusterNode) processAppendEntriesResult(resultWithContext appendEntr
 				}
 				if matchCount >= node.getQuorum() {
 					node.state.commitIndex = i
-					go func() {
-						node.applyEntriesCh <- struct{}{}
-						node.sendAppendEntriesCh <- struct{}{}
-					}()
+					node.controller.applyEntries()
+					node.controller.broadcastAppendEntries()
 					break
 				}
 			}
@@ -233,11 +202,11 @@ func (node *clusterNode) processAppendEntriesResult(resultWithContext appendEntr
 
 func (node *clusterNode) sendAppendEntries() {
 	state := node.state
-	node.resetHeartbeatTimeoutCh <- struct{}{}
+	node.controller.resetHeartbeatTimeout()
 
 	if len(node.peers) == 0 {
 		state.commitIndex = len(state.log) - 1
-		go func() { node.applyEntriesCh <- struct{}{} }()
+		node.controller.applyEntries()
 	}
 
 	for peerID, peerAddress := range node.peers {
@@ -257,19 +226,7 @@ func (node *clusterNode) sendAppendEntries() {
 			Entries:      entries,
 			LeaderCommit: state.commitIndex,
 		}
-		go func(peerID int, peerAddress NodeAddress) {
-			result, err := node.transport.AppendEntries(peerAddress, args)
-
-			if err == nil {
-				resultWithContext := appendEntriesResultWithContext{
-					result:        result,
-					peerID:        peerID,
-					prevLogIndex:  prevLogIndex,
-					entriesNumber: len(args.Entries),
-				}
-				node.appendEntriesResultCh <- resultWithContext
-			}
-		}(peerID, peerAddress)
+		node.controller.sendAppendEntries(peerAddress, args, peerID, prevLogIndex)
 	}
 }
 
@@ -282,9 +239,7 @@ func (node *clusterNode) processCommandRequest(commandRequest commandRequest) {
 		node.state.log = append(node.state.log, newLogEntry)
 		logIndex := len(node.state.log) - 1
 		node.commandResultsChMap[logIndex] = commandRequest.result
-		go func() {
-			node.sendAppendEntriesCh <- struct{}{}
-		}()
+		node.controller.broadcastAppendEntries()
 	} else {
 		commandRequest.result <- CommandResult{
 			Err: errors.New("Node is not a leader"),
@@ -308,12 +263,10 @@ func (node *clusterNode) applyEntries() {
 		logIndexToApply := node.state.lastApplied + 1
 		commandResult := node.stateMachine.Apply(node.state.log[logIndexToApply].Command)
 		node.state.lastApplied++
-		go func() {
-			node.commandResultsCh <- commandResultWithContext{
-				logIndex: logIndexToApply,
-				result:   commandResult,
-			}
-		}()
+		node.controller.acknowledgeCommandResult(commandResultWithContext{
+			logIndex: logIndexToApply,
+			result:   commandResult,
+		})
 	}
 }
 
@@ -334,87 +287,13 @@ func (node *clusterNode) getState(request getStateRequest) {
 
 func (node *clusterNode) shutdown() {
 	if node.state.getMode() == Leader {
-		node.stopHeartbeatCh <- struct{}{}
+		node.controller.stopHeartbeat()
 	} else {
-		node.stopElectionTimerCh <- struct{}{}
+		node.controller.stopElectionTimer()
 	}
 	node.state.setMode(Shutdown)
 	node.state.leaderID = -1
-
-	node.transport.Close()
-
 	node.shutdownLock.Unlock()
-}
-
-func (node *clusterNode) runElectionTimer() {
-	go func() {
-		electionTimeout := time.Duration(150+rand.Intn(150)) * time.Millisecond
-	ElectionTimeoutLoop:
-		for {
-			electionTimer := time.NewTimer(electionTimeout)
-			select {
-			case <-electionTimer.C:
-				node.startElectionCh <- struct{}{}
-			case <-node.resetElectionTimeoutCh:
-				break
-			case <-node.stopElectionTimerCh:
-				electionTimer.Stop()
-				break ElectionTimeoutLoop
-			}
-			electionTimer.Stop()
-		}
-	}()
-}
-
-func (node *clusterNode) runHeartbeat() {
-	go func() {
-		node.sendAppendEntriesCh <- struct{}{}
-		heartbeatTimeout := time.Duration(50) * time.Millisecond
-	HeartbeatLoop:
-		for {
-			heartbeatTimer := time.NewTimer(heartbeatTimeout)
-			select {
-			case <-heartbeatTimer.C:
-				node.sendAppendEntriesCh <- struct{}{}
-			case <-node.resetHeartbeatTimeoutCh:
-				break
-			case <-node.stopHeartbeatCh:
-				heartbeatTimer.Stop()
-				break HeartbeatLoop
-			}
-			heartbeatTimer.Stop()
-		}
-	}()
-}
-
-func (node *clusterNode) run() {
-	for {
-		select {
-		case requestVoteRequest := <-node.requestVoteRequestCh:
-			requestVoteRequest.Result <- node.requestVote(requestVoteRequest.Args)
-		case requestVoteResult := <-node.requestVoteResultCh:
-			node.processVoteResult(requestVoteResult)
-		case appendEntriesResultWithContext := <-node.appendEntriesResultCh:
-			node.processAppendEntriesResult(appendEntriesResultWithContext)
-		case appendEntriesRequest := <-node.appendEntriesRequestCh:
-			appendEntriesRequest.Result <- node.appendEntries(appendEntriesRequest.Args)
-		case <-node.sendAppendEntriesCh:
-			node.sendAppendEntries()
-		case <-node.applyEntriesCh:
-			node.applyEntries()
-		case <-node.startElectionCh:
-			node.startElection()
-		case commandRequest := <-node.requestCommandRequestCh:
-			node.processCommandRequest(commandRequest)
-		case commandResultWithContext := <-node.commandResultsCh:
-			node.processCommandResult(commandResultWithContext)
-		case getStateRequest := <-node.getStateRequestCh:
-			node.getState(getStateRequest)
-		case <-node.shutdownCh:
-			node.shutdown()
-			break
-		}
-	}
 }
 
 //NewNode is a method constructing raft cluster node which implement raft.Node interface
@@ -438,28 +317,14 @@ func NewNode(id int, peers map[int]NodeAddress, transport Transport, stateMachin
 	}
 
 	node := &clusterNode{
-		id:                      id,
-		peers:                   peers,
-		state:                   state,
-		stateMachine:            stateMachine,
-		transport:               transport,
-		requestVoteResultCh:     make(chan RequestVoteResult),
-		requestVoteRequestCh:    make(chan RequestVoteRequest),
-		appendEntriesResultCh:   make(chan appendEntriesResultWithContext),
-		appendEntriesRequestCh:  make(chan AppendEntriesRequest),
-		applyEntriesCh:          make(chan struct{}),
-		startElectionCh:         make(chan struct{}),
-		resetElectionTimeoutCh:  make(chan struct{}),
-		stopElectionTimerCh:     make(chan struct{}),
-		resetHeartbeatTimeoutCh: make(chan struct{}),
-		stopHeartbeatCh:         make(chan struct{}),
-		sendAppendEntriesCh:     make(chan struct{}),
-		shutdownCh:              make(chan struct{}),
-		requestCommandRequestCh: make(chan commandRequest),
-		getStateRequestCh:       make(chan getStateRequest),
-		commandResultsChMap:     make(map[int]chan CommandResult),
-		commandResultsCh:        make(chan commandResultWithContext),
+		id:                  id,
+		peers:               peers,
+		state:               state,
+		stateMachine:        stateMachine,		
+		commandResultsChMap: make(map[int]chan CommandResult),
 	}
+
+	node.controller = newNodeController(node, transport)
 
 	return node
 }
@@ -479,7 +344,7 @@ func (node *clusterNode) GetState() NodeState {
 	if mode == NotStarted || mode == Shutdown {
 		go node.getState(request)
 	} else {
-		node.getStateRequestCh <- request
+		node.controller.processGetStateRequest(request)
 	}
 
 	return <-getStateResultCh
@@ -489,15 +354,15 @@ func (node *clusterNode) ProcessCommand(command interface{}) CommandResult {
 	node.shutdownLock.RLock()
 	defer node.shutdownLock.RUnlock()
 
-	mode := node.state.getMode()
-	if mode == Leader {
+	if node.state.getMode() == Leader {
 		commandResultCh := make(chan CommandResult)
 		defer close(commandResultCh)
 
-		node.requestCommandRequestCh <- commandRequest{
+		node.controller.processCommand(commandRequest{
 			command: command,
 			result:  commandResultCh,
-		}
+		})
+
 		select {
 		case commandResult := <-commandResultCh:
 			return commandResult
@@ -506,7 +371,6 @@ func (node *clusterNode) ProcessCommand(command interface{}) CommandResult {
 				Err: errors.New("Timeout error"),
 			}
 		}
-
 	}
 	return CommandResult{
 		Err: errors.New("Command can be processed only on Leader node"),
@@ -517,7 +381,7 @@ func (node *clusterNode) Shutdown() error {
 	node.shutdownLock.Lock()
 
 	if node.state.getMode() != Shutdown {
-		node.shutdownCh <- struct{}{}
+		node.controller.shutdown()
 		return nil
 	}
 	return errors.New("The node has already been shutdown")
@@ -526,9 +390,8 @@ func (node *clusterNode) Shutdown() error {
 func (node *clusterNode) Start() error {
 	if node.state.getMode() == NotStarted {
 		node.state.setMode(Follower)
-		node.transport.Subscribe(node.requestVoteRequestCh, node.appendEntriesRequestCh)
-		go node.run()
-		node.runElectionTimer()
+		node.controller.run()
+		node.controller.runElectionTimer()
 		return nil
 	}
 	return errors.New("Can't start node which already has been started")

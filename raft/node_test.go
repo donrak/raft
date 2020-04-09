@@ -173,8 +173,7 @@ func TestFailedLeader(t *testing.T) {
 		<-time.After(time.Millisecond)
 		state = nodes[1].GetState()
 	}
-	originalLeaderId := state.LeaderID
-	t.Log("Original leader: ", originalLeaderId)
+	originalLeaderId := state.LeaderID	
 	processCommands(nodes[originalLeaderId], "X", 4)
 	transports[originalLeaderId].pause()
 
@@ -189,8 +188,7 @@ func TestFailedLeader(t *testing.T) {
 		state = nodes[followerId].GetState()
 	}
 
-	newLeaderId := state.LeaderID
-	t.Log("Original leader: ", newLeaderId)
+	newLeaderId := state.LeaderID	
 	processCommands(nodes[newLeaderId], "Y", 4)
 	transports[originalLeaderId].resume()
 
